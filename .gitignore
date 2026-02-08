@@ -1,0 +1,24 @@
+# Virtualenv
+Include/
+Lib/
+prova_02_rotazione/
+prova_font/
+Scripts/
+pyvenv.cfg
+.git/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# VS Code
+.vscode/
+
+# Logs / temp
+*.log
+*.tmp
+
+# OS
+.DS_Store
+Thumbs.db
