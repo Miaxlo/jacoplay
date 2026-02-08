@@ -2096,6 +2096,14 @@ def start_match(
     hover_big_token: Optional[str] = None
 
     selected_attacker_idx: Optional[int] = None
+    confirm_abandon = False
+
+    popup_rect = pygame.Rect(0, 0, 820, 260)
+    popup_rect.center = (LOGICAL_W // 2, LOGICAL_H // 2)
+    btn_w, btn_h = 220, 70
+    btn_y = popup_rect.bottom - 90
+    btn_ok_rect = pygame.Rect(popup_rect.centerx - btn_w - 40, btn_y, btn_w, btn_h)
+    btn_cancel_rect = pygame.Rect(popup_rect.centerx + 40, btn_y, btn_w, btn_h)
 
     # Skill system (latched btn_skill)
     #skill_active: bool = False
@@ -2125,27 +2133,34 @@ def start_match(
             if event.type == pygame.QUIT:
                 return "MENU"
             if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                return "MENU"
+                confirm_abandon = not confirm_abandon
+                continue
             if event.type == pygame.MOUSEBUTTONUP:
                 if event.button == 1:
                     left_up = True
                 elif event.button == 3:
                     right_up = True
 
-        # Abbandona sempre attivo
-        if left_up and btn_abbandona.is_clicked(mouse_logical, True):
-            audio.stop_all()
-            return "MENU"
+        if confirm_abandon:
+            if left_up and btn_ok_rect.collidepoint(mouse_logical):
+                audio.stop_all()
+                return "MENU"
+            if left_up and btn_cancel_rect.collidepoint(mouse_logical):
+                confirm_abandon = False
+        else:
+            # Abbandona sempre attivo
+            if left_up and btn_abbandona.is_clicked(mouse_logical, True):
+                confirm_abandon = True
 
-        # Cambio turno (utente -> AI)
-        if left_up and user_turn and btn_completa.is_clicked(mouse_logical, True):
-            user_turn = False
-            turn_started = True
+            # Cambio turno (utente -> AI)
+            if left_up and user_turn and btn_completa.is_clicked(mouse_logical, True):
+                user_turn = False
+                turn_started = True
 
         def_by_id = {c.id: c for c in all_cards}
 
         # ===== Inizio turno: reset contatori + pesca automatica (1 carta se <7) =====
-        if turn_started:
+        if not confirm_abandon and turn_started:
             current = user_state if user_turn else ai_state
             current.energy_played_this_turn = 0
             current.dinos_played_this_turn = 0
@@ -2253,13 +2268,16 @@ def start_match(
 
         # ===== Hover big sulla mano utente (sempre, anche fuori turno) =====
         hover_big_token = None
-        user_hand_rects = hand_card_rects(user_state.hand, POS_HAND_USER)
-        idx_hover = hovered_hand_index(mouse_logical, user_hand_rects)
-        if idx_hover is not None and 0 <= idx_hover < len(user_state.hand):
-            hover_big_token = user_state.hand[idx_hover]
+        if not confirm_abandon:
+            user_hand_rects = hand_card_rects(user_state.hand, POS_HAND_USER)
+            idx_hover = hovered_hand_index(mouse_logical, user_hand_rects)
+            if idx_hover is not None and 0 <= idx_hover < len(user_state.hand):
+                hover_big_token = user_state.hand[idx_hover]
+        else:
+            user_hand_rects = []
 
         # ===== Click su carta mano: solo se turno utente =====
-        if left_up and user_turn:
+        if not confirm_abandon and left_up and user_turn:
             idx_click = hovered_hand_index(mouse_logical, user_hand_rects)
             if idx_click is not None and 0 <= idx_click < len(user_state.hand):
                 token = user_state.hand[idx_click]
@@ -2298,7 +2316,7 @@ def start_match(
                         user_state.dinos_played_this_turn += 1 
 
         # ===== ATTACCO NORMALE (solo turno utente) =====
-        if user_turn:
+        if not confirm_abandon and user_turn:
             user_field_rects = field_card_rects(user_state.field, POS_FIELD_USER)
             ai_field_rects = field_card_rects(ai_state.field, POS_FIELD_AI)
 
@@ -2503,10 +2521,31 @@ def start_match(
 
         draw_toast(surf, toast, fonts["title"])
 
+        if confirm_abandon:
+            pygame.draw.rect(surf, NERO, popup_rect)
+            pygame.draw.rect(surf, BIANCO, popup_rect, 3)
+
+            pygame.draw.rect(surf, NERO, btn_ok_rect)
+            pygame.draw.rect(surf, BIANCO, btn_ok_rect, 3)
+            pygame.draw.rect(surf, NERO, btn_cancel_rect)
+            pygame.draw.rect(surf, BIANCO, btn_cancel_rect, 3)
+
+            q_txt = fonts["title"].render("Vuoi abbandonare la partita?", True, BIANCO)
+            q_rect = q_txt.get_rect(center=(popup_rect.centerx, popup_rect.y + 80))
+            surf.blit(q_txt, q_rect.topleft)
+
+            ok_txt = fonts["title"].render("OK", True, BIANCO)
+            ok_rect = ok_txt.get_rect(center=btn_ok_rect.center)
+            surf.blit(ok_txt, ok_rect.topleft)
+
+            cancel_txt = fonts["title"].render("ANNULLA", True, BIANCO)
+            cancel_rect = cancel_txt.get_rect(center=btn_cancel_rect.center)
+            surf.blit(cancel_txt, cancel_rect.topleft)
+
         scaler.present()
 
         # ===== Turno AI: per ora solo "passa" (poi nel prossimo step faremo la sequenza AI) =====
-        if not user_turn:
+        if not confirm_abandon and not user_turn:
             # 1) AI gioca carte
             ai_play_cards(audio=audio, ai_state=ai_state, def_by_id=def_by_id)
 
