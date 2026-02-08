@@ -1782,6 +1782,7 @@ def select_leader_screen(
     cache: AssetCache,
     audio: Audio,
     font_title: pygame.font.Font,
+    font_hp: pygame.font.Font,
     faction_user: str,
     all_cards: List[CardDef],
     clock: pygame.time.Clock,
@@ -1806,7 +1807,7 @@ def select_leader_screen(
     row2_y = 620
     gap_x = 10
 
-    cards_rects: List[Tuple[int, pygame.Rect]] = []
+    cards_rects: List[Tuple[int, int, pygame.Rect]] = []
     for i, c in enumerate(user_cards):
         row = 0 if i < 5 else 1
         col = i if i < 5 else (i - 5)
@@ -1814,7 +1815,7 @@ def select_leader_screen(
         y = row1_y if row == 0 else row2_y
         img = cache.image(f"{c.id}.png")
         rect = img.get_rect(topleft=(x, y))
-        cards_rects.append((c.id, rect))
+        cards_rects.append((c.id, c.hp, rect))
 
     title_surf = font_title.render(TITLE_LEADER, True, BIANCO)
     title_rect = title_surf.get_rect(center=(LOGICAL_W // 2, 120))
@@ -1839,7 +1840,7 @@ def select_leader_screen(
                     right_up = True
 
         if left_up:
-            for cid, rect in cards_rects:
+            for cid, _, rect in cards_rects:
                 if rect.collidepoint(mouse_logical):
                     leader_user_id = cid
                     break
@@ -1849,9 +1850,10 @@ def select_leader_screen(
         surf.blit(title_surf, title_rect)
 
         # draw cards
-        for cid, rect in cards_rects:
+        for cid, hp_max, rect in cards_rects:
             img = cache.image(f"{cid}.png")
-            surf.blit(img, rect.topleft)
+            img_hp = draw_card_hp_on_field(img, hp_max, hp_max, font_hp)
+            surf.blit(img_hp, rect.topleft)
 
         scaler.present()
 
@@ -2016,6 +2018,7 @@ def start_match(
         cache=cache,
         audio=audio,
         font_title=fonts["title"],
+        font_hp=fonts["hp"],
         faction_user=faction_user,
         all_cards=all_cards,
         clock=clock,
