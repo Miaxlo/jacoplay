@@ -497,6 +497,13 @@ def draw_one_card_with_animation(
             surf.blit(deck_img, POS_DECK_USER if is_user else POS_DECK_AI)
         if player.deck_count() > 0:
             surf.blit(deck_img, POS_DECK_AI if is_user else POS_DECK_USER)
+        draw_deck_counts(
+            surf,
+            deck_img,
+            font_energy,
+            ai_count=(other_player.deck_count() if is_user else player.deck_count()),
+            user_count=(player.deck_count() if is_user else other_player.deck_count()),
+        )
 
         # icone
         surf.blit(icon_ai, POS_ENERGY_AI)
@@ -644,6 +651,13 @@ def animate_normal_attack(
             surf.blit(deck_img, POS_DECK_AI)
         if user_state.deck_count() > 0:
             surf.blit(deck_img, POS_DECK_USER)
+        draw_deck_counts(
+            surf,
+            deck_img,
+            font_energy,
+            ai_count=ai_state.deck_count(),
+            user_count=user_state.deck_count(),
+        )
 
         surf.blit(icon_ai, POS_ENERGY_AI)
         surf.blit(icon_user, POS_ENERGY_USER)
@@ -758,6 +772,13 @@ def animate_normal_attack_ai(
             surf.blit(deck_img, POS_DECK_AI)
         if user_state.deck_count() > 0:
             surf.blit(deck_img, POS_DECK_USER)
+        draw_deck_counts(
+            surf,
+            deck_img,
+            font_energy,
+            ai_count=ai_state.deck_count(),
+            user_count=user_state.deck_count(),
+        )
 
         surf.blit(icon_ai, POS_ENERGY_AI)
         surf.blit(icon_user, POS_ENERGY_USER)
@@ -866,6 +887,13 @@ def animate_skill_hit(
             surf.blit(deck_img, POS_DECK_AI)
         if user_state.deck_count() > 0:
             surf.blit(deck_img, POS_DECK_USER)
+        draw_deck_counts(
+            surf,
+            deck_img,
+            font_energy,
+            ai_count=ai_state.deck_count(),
+            user_count=user_state.deck_count(),
+        )
 
         surf.blit(icon_ai, POS_ENERGY_AI)
         surf.blit(icon_user, POS_ENERGY_USER)
@@ -936,6 +964,13 @@ def animate_heal_icon(
             surf.blit(deck_img, POS_DECK_AI)
         if user_state.deck_count() > 0:
             surf.blit(deck_img, POS_DECK_USER)
+        draw_deck_counts(
+            surf,
+            deck_img,
+            font_energy,
+            ai_count=ai_state.deck_count(),
+            user_count=user_state.deck_count(),
+        )
 
         surf.blit(icon_ai, POS_ENERGY_AI)
         surf.blit(icon_user, POS_ENERGY_USER)
@@ -2494,6 +2529,13 @@ def start_match(
             surf.blit(deck_img, POS_DECK_AI)
         if user_state.deck_count() > 0:
             surf.blit(deck_img, POS_DECK_USER)
+        draw_deck_counts(
+            surf,
+            deck_img,
+            font_energy,
+            ai_count=ai_state.deck_count(),
+            user_count=user_state.deck_count(),
+        )
 
         surf.blit(icon_ai, POS_ENERGY_AI)
         surf.blit(icon_user, POS_ENERGY_USER)
@@ -2577,6 +2619,13 @@ def start_match(
                 surf.blit(deck_img, POS_DECK_AI)
             if user_state.deck_count() > 0:
                 surf.blit(deck_img, POS_DECK_USER)
+            draw_deck_counts(
+                surf,
+                deck_img,
+                font_energy,
+                ai_count=ai_state.deck_count(),
+                user_count=user_state.deck_count(),
+            )
 
             surf.blit(icon_ai, POS_ENERGY_AI)
             surf.blit(icon_user, POS_ENERGY_USER)
@@ -2672,10 +2721,29 @@ def draw_field_row(
             # testo punti scudo sopra l'icona
             shield_txt = font_shield.render(str(inst.shield_points), True, BIANCO)
             surf.blit(shield_txt, (x + 92 + 34, y + 70 + 19))
-        if inst.protect_active:
-            ico = cache.image(ICON_PROTECT)
-            surf.blit(ico, (x + 10, y + 70))
+    if inst.protect_active:
+        ico = cache.image(ICON_PROTECT)
+        surf.blit(ico, (x + 10, y + 70))
 
+
+def draw_deck_counts(
+    surf: pygame.Surface,
+    deck_img: pygame.Surface,
+    font: pygame.font.Font,
+    ai_count: int,
+    user_count: int,
+) -> None:
+    ai_rect = deck_img.get_rect(topleft=POS_DECK_AI)
+    user_rect = deck_img.get_rect(topleft=POS_DECK_USER)
+
+    ai_txt = font.render(str(ai_count), True, BIANCO)
+    user_txt = font.render(str(user_count), True, BIANCO)
+
+    ai_pos = ai_txt.get_rect(midtop=(ai_rect.centerx, ai_rect.bottom + 6))
+    user_pos = user_txt.get_rect(midbottom=(user_rect.centerx, user_rect.top - 6))
+
+    surf.blit(ai_txt, ai_pos.topleft)
+    surf.blit(user_txt, user_pos.topleft)
 
 
 
@@ -2718,6 +2786,13 @@ def run_initial_draw_animations(
             surf.blit(deck_img, POS_DECK_AI)
         if user_state.deck_count() > 0:
             surf.blit(deck_img, POS_DECK_USER)
+        draw_deck_counts(
+            surf,
+            deck_img,
+            font_energy,
+            ai_count=ai_state.deck_count(),
+            user_count=user_state.deck_count(),
+        )
 
         # Icone energia
         surf.blit(icon_ai, POS_ENERGY_AI)
