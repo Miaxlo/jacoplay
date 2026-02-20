@@ -1,4 +1,4 @@
-import os
+﻿import os
 import sys
 import json
 import math
@@ -95,7 +95,7 @@ def safe_normalize(v: pygame.Vector2) -> pygame.Vector2:
     return v / l
 
 def angle_from_velocity(v: pygame.Vector2) -> float:
-    # 0° = right, 90° = down, 180° = left, 270° = up
+    # 0o = right, 90o = down, 180o = left, 270o = up
     if vec_length(v) < 1e-6:
         return 0.0
     return (math.degrees(math.atan2(v.y, v.x)) + 360.0) % 360.0
@@ -122,6 +122,20 @@ def load_font(size: int) -> pygame.font.Font:
 def draw_text(surf: pygame.Surface, text: str, font: pygame.font.Font, x: int, y: int, color=(255, 255, 255)):
     img = font.render(text, True, color)
     surf.blit(img, (x, y))
+
+def draw_text_shadowed(
+    surf: pygame.Surface,
+    text: str,
+    font: pygame.font.Font,
+    x: int,
+    y: int,
+    color=(255, 255, 255),
+    shadow_color=(0, 0, 0),
+    shadow_offset=(2, 2),
+):
+    sx, sy = shadow_offset
+    draw_text(surf, text, font, x + sx, y + sy, shadow_color)
+    draw_text(surf, text, font, x, y, color)
 
 def compute_letterbox(dst_w: int, dst_h: int) -> Tuple[pygame.Rect, float]:
     sx = dst_w / LOGICAL_W
@@ -159,6 +173,7 @@ class TrackInfo:
     laps: int
     start_grid: List[Dict]
     finish_line: Dict
+    checkpoint: Optional[Dict]
     waypoints: List[Dict]
 
 def load_cars() -> List[CarModel]:
@@ -191,6 +206,7 @@ def load_tracks_meta() -> Dict[str, TrackInfo]:
                 laps=3,
                 start_grid=[{"x": 960, "y": 900, "angle": 270} for _ in range(8)],
                 finish_line={"x": 900, "y": 880, "width": 200, "height": 20},
+                checkpoint=None,
                 waypoints=[{"x": 960, "y": 900}, {"x": 1400, "y": 700}, {"x": 960, "y": 400}, {"x": 500, "y": 700}],
             )
         }
@@ -205,6 +221,7 @@ def load_tracks_meta() -> Dict[str, TrackInfo]:
             laps=int(t["laps"]),
             start_grid=t["start_grid"],
             finish_line=t["finish_line"],
+            checkpoint=t.get("checkpoint"),
             waypoints=t["waypoints"],
         )
         out[ti.name] = ti
@@ -281,6 +298,18 @@ class Track:
             int(self.info.finish_line["width"]),
             int(self.info.finish_line["height"]),
         )
+        cp = self.info.checkpoint
+        self.checkpoint_rect: Optional[pygame.Rect] = None
+        if cp is not None:
+            cp_w = cp.get("width", cp.get("widht"))
+            cp_h = cp.get("height")
+            if cp_w is not None and cp_h is not None:
+                self.checkpoint_rect = pygame.Rect(
+                    int(cp["x"]),
+                    int(cp["y"]),
+                    int(cp_w),
+                    int(cp_h),
+                )
         self.waypoints = [pygame.Vector2(w["x"], w["y"]) for w in self.info.waypoints]
 
     def surface_color_at(self, pos: pygame.Vector2) -> Tuple[int, int, int]:
@@ -312,19 +341,27 @@ class Car:
         self.steering_deg = map_1_5(model.sterzo, 90, 180)      # deg/s
         # robustness used later for HP; for now affects how much wall slows you (simple)
         self.robust = map_1_5(model.robustezza, 0.7, 1.0)
+        self.damage_taken_mult = map_1_5(model.robustezza, 1.00, 0.70)
+        self.max_hp = map_1_5(model.robustezza, 60.0, 120.0)
+        self.hp = self.max_hp
 
         # status effects timers
         self.boost_timer = 0.0
         self.oil_timer = 0.0
         self.repair_timer = 0.0
+        self.damage_cooldown = 0.0
+        self.respawn_protect_timer = 0.0
 
         # lap tracking (simple)
         self.laps_done = 0
         self._was_on_finish = None
+        self._needs_checkpoint_before_next_lap = False
         self.race_done = False
         self.finish_order = 0
         self.just_hit_wall = False
         self.wall_hit_speed = 0.0
+        self.spawn_pos = pygame.Vector2(self.pos)
+        self.spawn_angle = self.angle
 
         # AI parameters
         self.ai_wp_index = 0
@@ -399,6 +436,57 @@ class Car:
         # axis-aligned collider (per spec)
         return pygame.Rect(int(self.pos.x - 22), int(self.pos.y - 14), 44, 28)
 
+    def set_spawn(self, pos: pygame.Vector2, angle: float):
+        self.spawn_pos = pygame.Vector2(pos)
+        self.spawn_angle = float(angle)
+
+    def apply_damage(self, raw_amount: float):
+        if raw_amount <= 0.0:
+            return
+        if self.respawn_protect_timer > 0.0 or self.damage_cooldown > 0.0:
+            return
+        self.hp -= raw_amount * self.damage_taken_mult
+        self.hp = max(0.0, self.hp)
+        self.damage_cooldown = 0.18
+
+    def respawn_at_spawn(self, track: "Track"):
+        self.pos = pygame.Vector2(self.spawn_pos)
+        self.angle = float(self.spawn_angle)
+        ang = math.radians(self.angle)
+        forward = pygame.Vector2(math.cos(ang), math.sin(ang))
+
+        # Respawn a bit after the finish line (race direction), not on top of it.
+        self.pos += forward * 72.0
+        if track.finish_rect.collidepoint(int(self.pos.x), int(self.pos.y)):
+            for _ in range(10):
+                self.pos += forward * 14.0
+                if not track.finish_rect.collidepoint(int(self.pos.x), int(self.pos.y)):
+                    break
+
+        self.vel = forward * 14.0
+
+        # ensure respawn is not inside wall
+        if track.surface_color_at(self.pos) == CLR_WALL:
+            escape = self._find_escape_from_wall(track, max_radius=90)
+            if escape is not None:
+                self.pos += escape
+
+        # recover and protect briefly to avoid instant chain-deaths
+        self.hp = self.max_hp
+        self.boost_timer = 0.0
+        self.oil_timer = 0.0
+        self.repair_timer = 0.0
+        self.damage_cooldown = 0.25
+        self.respawn_protect_timer = 1.0
+        self._was_on_finish = track.finish_rect.collidepoint(int(self.pos.x), int(self.pos.y))
+        if track.checkpoint_rect is not None:
+            # after HP respawn near finish, require checkpoint before counting a new lap
+            self._needs_checkpoint_before_next_lap = True
+        if not self.is_player:
+            self.ai_unstuck_reverse_timer = 0.0
+            # on HP respawn, restart navigation from waypoint 1
+            self.ai_wp_index = 0
+
     def _find_escape_from_wall(self, track: Track, max_radius: int = 40) -> Optional[pygame.Vector2]:
         # probe a small neighborhood to find first non-wall pixel
         dirs = (
@@ -422,6 +510,8 @@ class Car:
         self.boost_timer = max(0.0, self.boost_timer - dt)
         self.oil_timer = max(0.0, self.oil_timer - dt)
         self.repair_timer = max(0.0, self.repair_timer - dt)
+        self.damage_cooldown = max(0.0, self.damage_cooldown - dt)
+        self.respawn_protect_timer = max(0.0, self.respawn_protect_timer - dt)
 
         # trigger zones by color
         if col == CLR_BOOST:
@@ -429,19 +519,26 @@ class Car:
         elif col == CLR_OIL:
             self.oil_timer = 2.0
         elif col == CLR_REPAIR:
-            self.repair_timer = 0.5  # placeholder (we'll heal HP later)
+            self.repair_timer = 0.7
+
+        # repair zone healing
+        if self.repair_timer > 0.0:
+            self.hp = min(self.max_hp, self.hp + 20.0 * dt)
 
         # wall: simple stop (later we add damage)
         if col == CLR_WALL:
             self.just_hit_wall = True
             self.wall_hit_speed = vec_length(self.vel)
+            # damage scales with impact speed
+            if self.wall_hit_speed > 35.0:
+                self.apply_damage((self.wall_hit_speed - 35.0) * 0.11)
             # push back opposite to movement; if almost stopped use facing direction
             push_dir = safe_normalize(self.vel)
             if vec_length(self.vel) < 1.0:
                 ang = math.radians(self.angle)
                 push_dir = pygame.Vector2(math.cos(ang), math.sin(ang))
-            self.pos -= push_dir * 8.0
-            self.vel *= 0.10
+            self.pos -= push_dir * 12.0
+            self.vel *= 0.04
 
             # anti-stuck fallback: relocate a few pixels to nearest non-wall area
             if track.surface_color_at(self.pos) == CLR_WALL:
@@ -456,19 +553,45 @@ class Car:
 
         # boost
         if self.boost_timer > 0:
-            max_speed *= 1.30
+            max_speed *= 1.55
+            accel *= 1.25
 
-        # oil: reduce control & steering (handled elsewhere); also reduce max speed a bit
+        # oil: reduce control (handled elsewhere); also reduce max speed a bit
         if self.oil_timer > 0:
-            max_speed *= 0.90
+            max_speed *= 0.68
+            accel *= 0.78
 
         # grass slowdown
         col = track.surface_color_at(self.pos)
         if col == CLR_GRASS:
-            max_speed *= 0.75
-            accel *= 0.80
+            max_speed *= 0.52
+            accel *= 0.58
+
+        # low HP penalty
+        hp_ratio = self.hp / max(self.max_hp, 1.0)
+        if hp_ratio < 0.35:
+            max_speed *= 0.88
+            accel *= 0.90
 
         return max_speed, accel
+
+    def _apply_curve_drift(
+        self,
+        vdir: pygame.Vector2,
+        steer_dir: pygame.Vector2,
+        speed: float,
+        speed_cap: float,
+        eff_control: float,
+        turn_ratio: float,
+    ) -> pygame.Vector2:
+        """Blend steering with inertia: low control keeps more old direction in curves."""
+        ctrl_t = clamp((eff_control - 0.35) / (0.92 - 0.35), 0.0, 1.0)
+        base_grip = lerp(0.52, 0.98, ctrl_t)
+        curve_push = 0.28 + 0.72 * clamp(turn_ratio, 0.0, 1.0)
+        speed_push = 0.25 + 0.75 * clamp(speed / max(speed_cap, 1e-6), 0.0, 1.0)
+        grip = 1.0 - (1.0 - base_grip) * curve_push * speed_push
+        blend_dir = safe_normalize(vdir.lerp(steer_dir, grip))
+        return blend_dir * speed
 
     def update_player(self, track: Track, keys, dt: float):
         self._apply_surface_effects(track, dt)
@@ -486,22 +609,35 @@ class Car:
         facing_dir = pygame.Vector2(math.cos(ang_facing), math.sin(ang_facing))
 
         max_speed, accel = self._compute_speed_caps(track)
+        eff_control = self.control
+        if self.oil_timer > 0.0:
+            eff_control = max(0.35, self.control * 0.55)
 
         # steering: rotate velocity direction towards desired direction (simple)
         if vec_length(dir_des) > 0.0 and vec_length(self.vel) > 2.0:
             vdir = safe_normalize(self.vel)
+            steer_des = pygame.Vector2(dir_des)
+            # In reverse, steering response must be mirrored.
+            moving_backward = self.vel.dot(facing_dir) < -2.0
+            if moving_backward:
+                steer_des *= -1.0
             # angle between
             ang_v = math.atan2(vdir.y, vdir.x)
-            ang_d = math.atan2(dir_des.y, dir_des.x)
+            ang_d = math.atan2(steer_des.y, steer_des.x)
             # shortest angle diff
             diff = (ang_d - ang_v + math.pi) % (2 * math.pi) - math.pi
             max_turn = math.radians(self.steering_deg) * dt
             diff = clamp(diff, -max_turn, max_turn)
             new_ang = ang_v + diff
-            # preserve speed magnitude, apply control to reduce lateral drift (arcade)
+            # preserve speed magnitude and blend turn with inertia based on control
             speed = vec_length(self.vel)
             new_dir = pygame.Vector2(math.cos(new_ang), math.sin(new_ang))
-            self.vel = new_dir * speed
+            turn_ratio = abs(diff) / max(max_turn, 1e-6)
+            if moving_backward:
+                # keep reverse maneuvers tighter, with less lateral slide
+                self.vel = new_dir * speed
+            else:
+                self.vel = self._apply_curve_drift(vdir, new_dir, speed, max_speed, eff_control, turn_ratio)
 
         # accelerate in desired direction
         if accelerating and vec_length(dir_des) > 0.0:
@@ -523,7 +659,7 @@ class Car:
             self.vel *= (1.0 - clamp(3.0 * dt, 0.0, 0.9))
 
         # control: dampen drift / stabilise
-        self.vel *= (1.0 - (1.0 - self.control) * 1.8 * dt)
+        self.vel *= (1.0 - (1.0 - eff_control) * 1.8 * dt)
 
         # clamp speed
         spd = vec_length(self.vel)
@@ -535,12 +671,14 @@ class Car:
         self.pos.x = clamp(self.pos.x, 0, LOGICAL_W)
         self.pos.y = clamp(self.pos.y, 0, LOGICAL_H)
 
-        # keep facing stable while moving backwards; avoid 180deg sprite flip
+        # orient sprite from velocity; when moving backwards, nose points opposite
         if vec_length(self.vel) > 1.0:
             facing_now = pygame.Vector2(math.cos(math.radians(self.angle)), math.sin(math.radians(self.angle)))
-            moving_forward_vs_facing = self.vel.dot(facing_now) >= 0.0
-            if moving_forward_vs_facing:
-                self.angle = angle_from_velocity(self.vel)
+            vel_ang = angle_from_velocity(self.vel)
+            if self.vel.dot(facing_now) >= 0.0:
+                self.angle = vel_ang
+            else:
+                self.angle = (vel_ang + 180.0) % 360.0
 
     def update_ai(self, track: Track, all_cars: List["Car"], dt: float):
         self._apply_surface_effects(track, dt)
@@ -627,6 +765,9 @@ class Car:
 
         # surface caps
         max_speed, accel = self._compute_speed_caps(track)
+        eff_control = self.control
+        if self.oil_timer > 0.0:
+            eff_control = max(0.35, self.control * 0.55)
 
         target_speed = max_speed * clamp(base_aggr + delta + overtake_boost, 0.75, 1.05)
 
@@ -644,15 +785,12 @@ class Car:
             diff = (ang_d - ang_v + math.pi) % (2 * math.pi) - math.pi
             max_turn = math.radians(self.steering_deg) * dt
 
-            # oil reduces steering effectiveness
-            if self.oil_timer > 0.0:
-                max_turn *= 0.65
-
             diff = clamp(diff, -max_turn, max_turn)
             new_ang = ang_v + diff
             speed = vec_length(self.vel)
             new_dir = pygame.Vector2(math.cos(new_ang), math.sin(new_ang))
-            self.vel = new_dir * speed
+            turn_ratio = abs(diff) / max(max_turn, 1e-6)
+            self.vel = self._apply_curve_drift(vdir, new_dir, speed, max_speed, eff_control, turn_ratio)
 
         # accelerate along dir_to_target to reach target_speed
         spd = vec_length(self.vel)
@@ -663,7 +801,7 @@ class Car:
             self.vel *= (1.0 - clamp(1.2 * dt, 0.0, 0.5))
 
         # control stabilization
-        self.vel *= (1.0 - (1.0 - self.control) * 1.6 * dt)
+        self.vel *= (1.0 - (1.0 - eff_control) * 1.6 * dt)
 
         # clamp
         spd = vec_length(self.vel)
@@ -734,13 +872,20 @@ class Car:
                 self.ai_overtake_boost_timer = self.rng.uniform(0.6, 1.2)
 
     def check_finish(self, track: Track):
+        # re-arm lap count only after passing checkpoint once
+        if track.checkpoint_rect is not None:
+            if track.checkpoint_rect.collidepoint(int(self.pos.x), int(self.pos.y)):
+                self._needs_checkpoint_before_next_lap = False
+
         on_finish = track.finish_rect.collidepoint(int(self.pos.x), int(self.pos.y))
         # prime state on first frame to avoid counting the spawn position as a completed lap
         if self._was_on_finish is None:
             self._was_on_finish = on_finish
             return
-        if on_finish and not self._was_on_finish:
+        if on_finish and not self._was_on_finish and not self._needs_checkpoint_before_next_lap:
             self.laps_done += 1
+            if track.checkpoint_rect is not None:
+                self._needs_checkpoint_before_next_lap = True
         self._was_on_finish = on_finish
 
     def draw(self, surf: pygame.Surface):
@@ -764,44 +909,55 @@ class MenuState(State):
         self.bkg = pygame.transform.smoothscale(self.bkg, (LOGICAL_W, LOGICAL_H))
         self.font_big = load_font(64)
         self.font = load_font(54)
-        self.items = ["Avvia partita", "Istruzioni", "Esci"]
         self.sel = 0
+
+    def _menu_items(self) -> List[str]:
+        diff_txt = "alta" if self.game.hard_difficulty else "normale"
+        return [
+            "Avvia partita",
+            f"difficolta': {diff_txt}",
+            "Istruzioni",
+            "Esci",
+        ]
 
     def _activate_selected(self):
         if self.sel == 0:
             self.game.push_state(CarSelectState(self.game))
         elif self.sel == 1:
+            self.game.hard_difficulty = not self.game.hard_difficulty
+        elif self.sel == 2:
             self.game.push_state(InstructionsState(self.game))
         else:
             self.game.running = False
 
     def _menu_item_rect(self, index: int) -> pygame.Rect:
         x = 90
-        y0 = LOGICAL_H - 260
+        y0 = LOGICAL_H - 360
         line_h = 78
-        txt = self.items[index]
+        txt = self._menu_items()[index]
         w, h = self.font.size(txt)
         return pygame.Rect(x - 8, y0 + index * line_h - 4, w + 16, h + 10)
 
     def handle_event(self, e):
+        items = self._menu_items()
         if e.type == pygame.KEYDOWN:
             if e.key == pygame.K_ESCAPE:
                 self.game.running = False
             if e.key in (pygame.K_DOWN, pygame.K_s):
-                self.sel = (self.sel + 1) % len(self.items)
+                self.sel = (self.sel + 1) % len(items)
             elif e.key in (pygame.K_UP, pygame.K_w):
-                self.sel = (self.sel - 1) % len(self.items)
+                self.sel = (self.sel - 1) % len(items)
             elif e.key in (pygame.K_RETURN, pygame.K_SPACE):
                 self._activate_selected()
         elif e.type == pygame.MOUSEMOTION:
             mx, my = e.pos
-            for i in range(len(self.items)):
+            for i in range(len(items)):
                 if self._menu_item_rect(i).collidepoint(mx, my):
                     self.sel = i
                     break
         elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
             mx, my = e.pos
-            for i in range(len(self.items)):
+            for i in range(len(items)):
                 if self._menu_item_rect(i).collidepoint(mx, my):
                     self.sel = i
                     self._activate_selected()
@@ -814,10 +970,11 @@ class MenuState(State):
         draw_text(surf, "CARS", self.font_big, 70, 70)
 
         x = 90
-        y = LOGICAL_H - 260  # posizione dentro riquadro basso-sinistra
+        y = LOGICAL_H - 360  # alzato per mantenere tutte le voci visibili
         line_h = 78
+        items = self._menu_items()
 
-        for i, it in enumerate(self.items):
+        for i, it in enumerate(items):
             col = (255, 220, 80) if i == self.sel else (255, 255, 255)
             draw_text(surf, it, self.font, x, y, col)
             y += line_h       
@@ -1020,11 +1177,12 @@ class RaceState(State):
             # give small initial velocity along angle
             ang = math.radians(car.angle)
             car.vel = pygame.Vector2(math.cos(ang), math.sin(ang)) * 5.0
+            car.set_spawn(car.pos, car.angle)
             if not car.is_player:
                 # requested: all cars start aiming at the first waypoint
                 car.ai_wp_index = 0
 
-        self.laps_target = int(self.track.info.laps)
+        self.laps_target = int(self.track.info.laps) + (1 if self.game.hard_difficulty else 0)
         self.countdown = 3.0
         self.race_started = False
         self.finished = False
@@ -1042,9 +1200,7 @@ class RaceState(State):
     def handle_event(self, e):
         if e.type == pygame.KEYDOWN:
             if e.key == pygame.K_ESCAPE:
-                # for now: exit race immediately (we'll add confirm dialog later)
-                self._stop_engine_sfx()
-                self.game.pop_state()
+                self.game.push_state(ConfirmAbandonState(self.game))
 
     def update(self, dt: float):
         keys = pygame.key.get_pressed()
@@ -1067,6 +1223,9 @@ class RaceState(State):
                 if not c.race_done:
                     c.update_ai(self.track, active_cars, dt)
 
+            # car-car collisions (simple AABB resolve)
+            self._resolve_car_collisions(active_cars, dt)
+
             # laps
             for c in self.cars:
                 if c.race_done:
@@ -1077,6 +1236,13 @@ class RaceState(State):
                     c.race_done = True
                     self.finish_counter += 1
                     c.finish_order = self.finish_counter
+
+            # HP: broken cars respawn at their grid spawn and continue current lap.
+            for c in self.cars:
+                if c.race_done:
+                    continue
+                if c.hp <= 0.0:
+                    c.respawn_at_spawn(self.track)
 
             if self.player.race_done:
                 self.finished = True
@@ -1120,17 +1286,25 @@ class RaceState(State):
                 c.draw(surf)
 
         # UI
-        draw_text(surf, f"Giro: {min(self.player.laps_done, self.laps_target)}/{self.laps_target}", self.font, 20, 20)
-        draw_text(surf, self.phase_label, self.font, 20, 118, (220, 220, 220))
-        draw_text(surf, f"Boost: {self.player.boost_timer:0.1f}", self.font, 20, 55, (180, 220, 255))
-        draw_text(surf, f"Olio:  {self.player.oil_timer:0.1f}", self.font, 20, 85, (255, 255, 160))
+        draw_text_shadowed(surf, f"Giro: {min(self.player.laps_done, self.laps_target)}/{self.laps_target}", self.font, 20, 20)
+        draw_text_shadowed(surf, self.phase_label, self.font, 20, 55, (220, 220, 220))
+        hp_col = (120, 255, 140) if self.player.hp > self.player.max_hp * 0.40 else (255, 140, 120)
+        draw_text_shadowed(surf, "HP:", self.font, 20, 90, hp_col)
+        hp_ratio = clamp(self.player.hp / max(self.player.max_hp, 1.0), 0.0, 1.0)
+        bar_x, bar_y = 92, 96
+        bar_w, bar_h = 260, 16
+        fill_w = int(bar_w * hp_ratio)
+        pygame.draw.rect(surf, (40, 40, 46), (bar_x, bar_y, bar_w, bar_h), border_radius=6)
+        if fill_w > 0:
+            pygame.draw.rect(surf, hp_col, (bar_x, bar_y, fill_w, bar_h), border_radius=6)
+        pygame.draw.rect(surf, (225, 225, 225), (bar_x, bar_y, bar_w, bar_h), width=2, border_radius=6)
 
         if not self.race_started:
             n = max(1, int(math.ceil(self.countdown)))
-            draw_text(surf, str(n), self.font_big, 950, 500, (255, 220, 80))
+            draw_text_shadowed(surf, str(n), self.font_big, 950, 500, (255, 220, 80))
 
         if self.finished:
-            draw_text(surf, "FINISH! Premi ESC", self.font_big, 700, 480, (255, 220, 80))
+            draw_text_shadowed(surf, "FINISH! Premi ESC", self.font_big, 700, 480, (255, 220, 80))
 
     def _build_standings_snapshot(self) -> List[Dict]:
         wps = self.track.waypoints
@@ -1163,6 +1337,63 @@ class RaceState(State):
             })
         return out
 
+    def _resolve_car_collisions(self, active_cars: List[Car], dt: float):
+        # Small-number O(n^2) pair resolution is fine for 8 cars.
+        n = len(active_cars)
+        for i in range(n):
+            a = active_cars[i]
+            ra = a.rect()
+            for j in range(i + 1, n):
+                b = active_cars[j]
+                rb = b.rect()
+                if not ra.colliderect(rb):
+                    continue
+
+                # Compute overlap along x/y and separate on the minimum axis.
+                overlap_x = min(ra.right, rb.right) - max(ra.left, rb.left)
+                overlap_y = min(ra.bottom, rb.bottom) - max(ra.top, rb.top)
+                if overlap_x <= 0 or overlap_y <= 0:
+                    continue
+
+                delta = b.pos - a.pos
+                if overlap_x < overlap_y:
+                    sign = 1.0 if delta.x >= 0 else -1.0
+                    push = (overlap_x * 0.5) + 0.8
+                    a.pos.x -= sign * push
+                    b.pos.x += sign * push
+                    normal = pygame.Vector2(sign, 0.0)
+                else:
+                    sign = 1.0 if delta.y >= 0 else -1.0
+                    push = (overlap_y * 0.5) + 0.8
+                    a.pos.y -= sign * push
+                    b.pos.y += sign * push
+                    normal = pygame.Vector2(0.0, sign)
+
+                # Dampen velocity and add a small impulse away from the impact normal.
+                rel = b.vel - a.vel
+                sep_speed = rel.dot(normal)
+                impulse = max(0.0, sep_speed) * 0.48 + 62.0 * dt
+                a.vel -= normal * impulse
+                b.vel += normal * impulse
+                a.vel *= 0.80
+                b.vel *= 0.80
+
+                # damage from car-car impact (mitigated by robustness in apply_damage)
+                impact_speed = abs(sep_speed)
+                if impact_speed > 20.0:
+                    damage = (impact_speed - 20.0) * 0.09 + min(overlap_x, overlap_y) * 0.04
+                    a.apply_damage(damage)
+                    b.apply_damage(damage)
+
+                # Keep bounds safe after correction.
+                a.pos.x = clamp(a.pos.x, 0, LOGICAL_W)
+                a.pos.y = clamp(a.pos.y, 0, LOGICAL_H)
+                b.pos.x = clamp(b.pos.x, 0, LOGICAL_W)
+                b.pos.y = clamp(b.pos.y, 0, LOGICAL_H)
+
+                # refresh rect for 'a' in case of multiple overlaps in same loop
+                ra = a.rect()
+
     def _init_race_sfx(self):
         # Reserve channels for 8 engine loops (one per car in visible race)
         try:
@@ -1191,7 +1422,7 @@ class RaceState(State):
                 if not ch.get_busy():
                     ch.play(snd, loops=-1)
                 # light pitch substitute via volume dynamics
-                vol = clamp(0.20 + (speed / max(c.max_speed, 1.0)) * 0.55, 0.18, 0.85)
+                vol = clamp(0.30 + (speed / max(c.max_speed, 1.0)) * 0.62, 0.26, 1.0)
                 ch.set_volume(vol)
             elif speed < 6.0:
                 ch.stop()
@@ -1206,7 +1437,17 @@ class RaceState(State):
                 continue
             if c.just_hit_wall and c.wall_hit_speed > 35.0 and self.game.crash_sounds:
                 try:
-                    random.choice(self.game.crash_sounds).play()
+                    snd = random.choice(self.game.crash_sounds)
+                    ch = snd.play()
+                    if ch is not None:
+                        # Louder crashes for higher impact speed.
+                        # <=55: normal/lower mix, >55: progressively boosted.
+                        impact = c.wall_hit_speed
+                        if impact > 55.0:
+                            t = clamp((impact - 55.0) / 80.0, 0.0, 1.0)
+                            ch.set_volume(0.88 + 0.12 * t)
+                        else:
+                            ch.set_volume(0.80)
                     self.crash_cooldown = 0.15
                 except Exception:
                     pass
@@ -1264,8 +1505,20 @@ class RaceResultsState(State):
         self.is_final_results = self.phase_label.strip().lower() == "finale"
 
     def _continue_flow(self):
-        if not self.player_qualified or self.tournament_over:
+        if not self.player_qualified:
             self.game.go_to_menu()
+            return
+        if self.tournament_over:
+            if self.player_rank in (1, 2, 3):
+                self.game.push_state(
+                    TournamentPodiumState(
+                        self.game,
+                        player_rank=self.player_rank,
+                        top3_rows=self.standings[:3],
+                    )
+                )
+            else:
+                self.game.go_to_menu()
             return
 
         visible_idx, visible_group = self.game.get_visible_group()
@@ -1284,6 +1537,9 @@ class RaceResultsState(State):
         )
 
     def handle_event(self, e):
+        if e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE:
+            self.game.push_state(ConfirmAbandonState(self.game))
+            return
         if e.type == pygame.KEYDOWN or e.type == pygame.MOUSEBUTTONDOWN:
             self._continue_flow()
 
@@ -1360,6 +1616,99 @@ class RaceResultsState(State):
             draw_text(surf, "Premi un tasto per tornare al menu", self.font_small, 70, 1014, (220, 220, 220))
 
 
+class TournamentPodiumState(State):
+    def __init__(self, game: "Game", player_rank: int, top3_rows: List[Dict]):
+        self.game = game
+        self.player_rank = int(player_rank)
+        self.top3_rows = list(top3_rows)[:3]
+        self.font_big = load_font(70)
+        self.font = load_font(38)
+        self.font_small = load_font(24)
+        self.preview_cache = {}
+
+        rank_label = {1: "primo", 2: "secondo", 3: "terzo"}.get(self.player_rank, "")
+        self.title = f"Complimenti, sei arrivato {rank_label}"
+
+        self.confetti = []
+        palette = [
+            (255, 220, 80),
+            (120, 255, 140),
+            (110, 200, 255),
+            (255, 130, 130),
+            (220, 160, 255),
+        ]
+        for _ in range(140):
+            self.confetti.append(
+                {
+                    "x": random.uniform(0, LOGICAL_W),
+                    "y": random.uniform(-LOGICAL_H, 0),
+                    "vx": random.uniform(-30.0, 30.0),
+                    "vy": random.uniform(80.0, 210.0),
+                    "size": random.randint(3, 7),
+                    "col": random.choice(palette),
+                }
+            )
+
+    def handle_event(self, e):
+        if e.type == pygame.KEYDOWN or e.type == pygame.MOUSEBUTTONDOWN:
+            self.game.go_to_menu()
+
+    def update(self, dt):
+        for c in self.confetti:
+            c["x"] += c["vx"] * dt
+            c["y"] += c["vy"] * dt
+            if c["x"] < -10:
+                c["x"] = LOGICAL_W + 10
+            elif c["x"] > LOGICAL_W + 10:
+                c["x"] = -10
+            if c["y"] > LOGICAL_H + 10:
+                c["x"] = random.uniform(0, LOGICAL_W)
+                c["y"] = random.uniform(-200, -20)
+
+    def draw(self, surf):
+        surf.fill((16, 16, 24))
+
+        # confetti layer
+        for c in self.confetti:
+            pygame.draw.rect(
+                surf,
+                c["col"],
+                (int(c["x"]), int(c["y"]), int(c["size"]), int(c["size"])),
+                border_radius=2,
+            )
+
+        draw_text_shadowed(surf, self.title, self.font_big, 180, 80, (255, 220, 80))
+
+        y = 260
+        row_h = 200
+        for i, row in enumerate(self.top3_rows, start=1):
+            model = row["model"]
+            box = pygame.Rect(240, y, 1440, row_h - 18)
+            pygame.draw.rect(surf, (32, 32, 42), box, border_radius=14)
+            pygame.draw.rect(surf, (255, 220, 80), box, width=2, border_radius=14)
+
+            draw_text_shadowed(surf, f"{i}", self.font_big, 280, y + 34, (255, 235, 120))
+            draw_text_shadowed(surf, model.nome, self.font, 400, y + 56, (245, 245, 245))
+
+            preview = self.preview_cache.get(model.nome)
+            if preview is None:
+                preview = load_image(model.sprite_path(), fallback_size=(120, 60), col=(120, 120, 120))
+                self.preview_cache[model.nome] = preview
+            pr = preview.get_rect(midright=(1630, y + 88))
+            surf.blit(preview, pr)
+
+            y += row_h
+
+        draw_text_shadowed(
+            surf,
+            "Premi un tasto per tornare al menu",
+            self.font_small,
+            700,
+            1010,
+            (220, 220, 220),
+        )
+
+
 class PreRaceState(State):
     def __init__(
         self,
@@ -1396,7 +1745,7 @@ class PreRaceState(State):
     def handle_event(self, e):
         if e.type == pygame.KEYDOWN:
             if e.key == pygame.K_ESCAPE:
-                self.game.pop_state()
+                self.game.push_state(ConfirmAbandonState(self.game))
             elif e.key in (pygame.K_RETURN, pygame.K_SPACE):
                 # replace pre-race with the actual race state
                 self.game.pop_state()
@@ -1434,12 +1783,60 @@ class PreRaceState(State):
 
         draw_text(
             surf,
-            "ENTER: avvia gara    ESC: torna a selezione auto",
+            "ENTER: avvia gara    ESC: conferma abbandono torneo",
             self.font_small,
             70,
             1000,
             (180, 180, 180),
         )
+
+
+class ConfirmAbandonState(State):
+    def __init__(self, game: "Game"):
+        self.game = game
+        self.font_big = load_font(52)
+        self.font = load_font(32)
+        self.sel = 1  # default: "No"
+        self.options = ["Si, abbandona", "No, continua"]
+
+    def _activate(self):
+        if self.sel == 0:
+            self.game.go_to_menu(reset_tournament=True)
+        else:
+            self.game.pop_state()
+
+    def handle_event(self, e):
+        if e.type == pygame.KEYDOWN:
+            if e.key in (pygame.K_LEFT, pygame.K_a, pygame.K_UP, pygame.K_w):
+                self.sel = (self.sel - 1) % len(self.options)
+            elif e.key in (pygame.K_RIGHT, pygame.K_d, pygame.K_DOWN, pygame.K_s):
+                self.sel = (self.sel + 1) % len(self.options)
+            elif e.key in (pygame.K_RETURN, pygame.K_SPACE):
+                self._activate()
+            elif e.key == pygame.K_ESCAPE:
+                self.game.pop_state()
+        elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
+            self._activate()
+
+    def update(self, dt): ...
+
+    def draw(self, surf):
+        overlay = pygame.Surface((LOGICAL_W, LOGICAL_H), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 180))
+        surf.blit(overlay, (0, 0))
+
+        box = pygame.Rect(420, 300, 1080, 480)
+        pygame.draw.rect(surf, (28, 28, 36), box, border_radius=16)
+        pygame.draw.rect(surf, (255, 220, 80), box, width=3, border_radius=16)
+
+        draw_text(surf, "Abbandonare il torneo?", self.font_big, 560, 380, (255, 220, 80))
+        draw_text(surf, "I progressi del torneo corrente andranno persi.", self.font, 520, 470, (230, 230, 230))
+
+        y = 560
+        for i, txt in enumerate(self.options):
+            col = (255, 220, 80) if i == self.sel else (220, 220, 220)
+            draw_text(surf, txt, self.font, 620, y, col)
+            y += 54
 
 
 # ==========================
@@ -1468,6 +1865,7 @@ class Game:
         self.cars: List[CarModel] = load_cars()
         self.tracks: Dict[str, TrackInfo] = load_tracks_meta()
         self.selected_car: Optional[CarModel] = None
+        self.hard_difficulty = False
         self.tournament_active = False
         self.tournament_phase = 0  # 0=Quarti, 1=Semifinale, 2=Finale
         self.tournament_groups: List[List[CarModel]] = []
@@ -1495,7 +1893,7 @@ class Game:
             if os.path.exists(p):
                 try:
                     s = pygame.mixer.Sound(p)
-                    s.set_volume(0.35)
+                    s.set_volume(0.48)
                     self.engine_sounds.append(s)
                 except Exception:
                     pass
@@ -1503,7 +1901,7 @@ class Game:
             if os.path.exists(p):
                 try:
                     s = pygame.mixer.Sound(p)
-                    s.set_volume(0.45)
+                    s.set_volume(0.72)
                     self.crash_sounds.append(s)
                 except Exception:
                     pass
@@ -1522,6 +1920,7 @@ class Game:
         try:
             pygame.mixer.music.set_endevent(0)
             pygame.mixer.music.load(MENU_MUSIC)
+            pygame.mixer.music.set_volume(0.50)
             pygame.mixer.music.play(-1)  # loop infinito
             self.music_mode = "menu"
         except Exception:
@@ -1537,6 +1936,7 @@ class Game:
         try:
             pygame.mixer.music.set_endevent(MUSIC_END_EVENT)
             pygame.mixer.music.load(path)
+            pygame.mixer.music.set_volume(0.32)
             pygame.mixer.music.play(0)  # una volta, poi alterna a fine traccia
             self.race_music_idx = idx % 2
         except Exception:
@@ -1546,7 +1946,7 @@ class Game:
         if not self.audio_enabled or self.music_mode == "race":
             return
         self.music_mode = "race"
-        self._play_race_track(0)
+        self._play_race_track(random.randint(0, 1))
 
     def _sync_music_with_state(self):
         if not self.states:
@@ -1595,14 +1995,25 @@ class Game:
         return "track01"
 
     def start_tournament(self, selected: CarModel):
-        self.selected_car = selected
+        if self.hard_difficulty:
+            self.selected_car = CarModel(
+                nome=selected.nome,
+                sprite=selected.sprite,
+                velocita_max=max(1, int(selected.velocita_max) - 1),
+                ripresa=max(1, int(selected.ripresa) - 1),
+                controllo=max(1, int(selected.controllo) - 1),
+                sterzo=max(1, int(selected.sterzo) - 1),
+                robustezza=max(1, int(selected.robustezza) - 1),
+            )
+        else:
+            self.selected_car = selected
         self.tournament_active = True
         self.tournament_phase = 0
 
-        pool = [c for c in self.cars if c.nome != selected.nome]
+        pool = [c for c in self.cars if c.nome != self.selected_car.nome]
         self.tournament_rng.shuffle(pool)
         # 32 auto -> 4 gruppi da 8, il giocatore sempre nel gruppo visibile
-        g0 = [selected] + pool[:7]
+        g0 = [self.selected_car] + pool[:7]
         g1 = pool[7:15]
         g2 = pool[15:23]
         g3 = pool[23:31]
@@ -1683,6 +2094,12 @@ class Game:
         }
 
     def go_to_menu(self, reset_tournament: bool = True):
+        if self.audio_enabled:
+            try:
+                # Stop any active SFX channels (engine/crash/beeps) before leaving race states.
+                pygame.mixer.stop()
+            except Exception:
+                pass
         self.states = [MenuState(self)]
         if reset_tournament:
             self.selected_car = None
